@@ -1,0 +1,404 @@
+<link rel="import" href="../polymer/polymer.html">
+
+<script src="canvas-layer.js"></script>
+<script src="shader-program.js"></script>
+
+<!--
+Element providing a
+[CanvasLayer](https://github.com/brendankenny/CanvasLayer)-based overlay for a
+Google Maps API v3 map to render an array of many objects as points on a map.
+Uses WebGL for rendering.
+
+##### Example
+
+    <point-overlay map="{{map}}" data="{{data}}"></point-overlay>
+
+@element point-overlay
+@blurb Element providing a CanvasLayer-based overlay for a Google Maps API v3 Map.
+@status alpha
+@homepage https://github.com/googlecodelabs/polymer-webgl-visualization
+-->
+<script>
+  /* jshint newcap: false */
+  /* global Polymer, ShaderProgram, createCanvasLayer, CanvasLayer */
+  Polymer({
+    is: 'point-overlay',
+    properties: {
+      /**
+       * A Google map object that this layer will overlay.
+       */
+      map: {
+        type: Object,
+        value: null,
+        observer: '_mapChanged'
+      },
+
+      /**
+       * The underlying CanvasLayer map overlay.
+       */
+      overlay: {
+        type: Object,
+        value: null,
+        readOnly: true
+      },
+
+      // TODO(bckenny): maybe increase size to account for filterPixelWidth
+      /**
+       * The vertex shader source. Uniforms beginning with '_' are reserved for
+       * internal <point-overlay> settings.
+       */
+      vertexShader: {
+        type: String,
+        value: function() {
+            return [
+            'attribute vec4 worldCoord;',
+
+            '// point-overlay provided uniforms',
+            'uniform mat4 _mapMatrix;',
+            'uniform float _resolutionScale;',
+
+            'uniform float pointSize;',
+            'uniform float pointAlpha;',
+
+            'varying float alpha;',
+            'varying float pointWidth;',
+
+            'void main() {',
+            '  // transform world coordinate by matrix uniform variable',
+            '  gl_Position = _mapMatrix * worldCoord;',
+
+            '  pointWidth = pointSize * _resolutionScale;',
+            '  gl_PointSize = pointWidth;',
+            '  alpha = pointAlpha;',
+            '}'
+          ].join('\n');
+        },
+      },
+
+      /**
+       * The fragment shader source. Uniforms beginning with '_' are reserved
+       * for internal <point-overlay> settings.
+       */
+      fragmentShader: {
+        type: String,
+        value: function() {
+            return [
+              'precision mediump float;',
+
+              'const vec4 color = vec4(.9, .3, .1, 1.);',
+              'const vec4 blank = vec4(0.);',
+              'const float filterPixelWidth = 1.4142135623730951;',
+
+              'varying float alpha;',
+              'varying float pointWidth;',
+
+              'void main() {',
+              '  float dist = length(gl_PointCoord - .5);',
+              '  float filterWidth = filterPixelWidth / pointWidth;',
+              '  float filtered = smoothstep(.5 - filterWidth, .5, dist);',
+              '  gl_FragColor = mix(color, blank, filtered) *  alpha;',
+              '}'
+            ].join('\n');
+        },
+      },
+
+      uniforms: {
+        type: Object,
+        readOnly: true,
+        value: function() {
+          return {
+            // Default values for default uniforms.
+            pointSize: 32,
+            pointAlpha: 1
+          };
+        },
+        notify: true
+      },
+
+      /**
+       * Array of objects to render as points, each object with at least `lat`
+       * and `lng` properties.
+       */
+      data: {
+        type: Array,
+        value: null,
+        notify: true,
+        observer: '_dataChanged'
+      },
+
+      /**
+       * Whether the visualization has been initialized and is running.
+       */
+      running: {
+        type: Boolean,
+        value: false,
+        notify: true,
+        readOnly: true
+      }
+    },
+
+     observers: [
+      '_uniformsChanged(uniforms.*)'
+    ],
+
+    /**
+     * If dependencies are initialized, schedules an overlay redraw on the next
+     * requestAnimationFrame callback.
+     */
+    scheduleUpdate: function() {
+      if (!this.running) {
+        if (!this._pointProgram || !this._pointArrayBuffer) {
+          return;
+        }
+
+        this.overlay.setUpdateHandler(this._update.bind(this));
+        this._setRunning(true);
+      }
+
+      this.overlay.scheduleUpdate();
+    },
+
+    /**
+     * The ratio between physical-device pixels and DPI-adjusted logical CSS
+     * pixels. Defaults to 1 if window.devicePixelRatio is not found.
+     * @private {number}
+     */
+    _resolutionScale: window.devicePixelRatio || 1,
+
+    /**
+     * The WebGL context.
+     * @private {WebGLRenderingContext}
+     */
+    _gl: null,
+
+    /**
+     * The ShaderProgram for drawing the points, initialized with the default
+     * shaders.
+     * @private {ShaderProgram}
+     */
+    _pointProgram: null,
+
+    /**
+     * The WebGL array buffer containing the points' coordinates.
+     * @private {WebGLBuffer}
+     */
+    _pointArrayBuffer: null,
+
+    /**
+     * The number of points to render
+     * @private {number}
+     */
+    _pointCount: 0,
+
+    /**
+     * The transform mapping pixel coordinates to WebGL coordinates.
+     * @private {Float32Array}
+     */
+    _pixelsToWebGLMatrix: null,
+
+    /**
+     * The matrix for calculating (map) world coordinates to pixel transform.
+     * @private {Float32Array}
+     */
+    _mapMatrix: null,
+
+    /**
+     * Converts from latitude to vertical world coordinate.
+     * @param {number} lat
+     * @return {number}
+     */
+    _latToY: function(lat) {
+      var merc = -Math.log(Math.tan((0.25 + lat / 360) * Math.PI));
+      return 128 * (1 + merc / Math.PI);
+    },
+
+    /**
+     * Converts from longitude to horizontal world coordinate.
+     * @param {number} lng
+     * @return {number}
+     */
+    _lngToX: function(lng) {
+      if (lng > 180) {
+        return 256 * (lng / 360 - 0.5);
+      }
+      return 256 * (lng / 360 + 0.5);
+    },
+
+    /**
+     * Applies a 2d scale to a 4x4 transform matrix.
+     * @param {!Float32Array} matrix
+     * @param {number} scaleX
+     * @param {number} scaleY
+     */
+    _scaleMatrix: function(matrix, scaleX, scaleY) {
+      // scale x and y, which is just scaling first two columns of matrix
+      matrix[0] *= scaleX;
+      matrix[1] *= scaleX;
+      matrix[2] *= scaleX;
+      matrix[3] *= scaleX;
+
+      matrix[4] *= scaleY;
+      matrix[5] *= scaleY;
+      matrix[6] *= scaleY;
+      matrix[7] *= scaleY;
+    },
+
+    /**
+     * Applies a 2d translation to a 4x4 transform matrix.
+     * @param {!Float32Array} matrix
+     * @param {number} tx
+     * @param {number} ty
+     */
+    _translateMatrix: function(matrix, tx, ty) {
+      // translation is in last column of matrix
+      matrix[12] += matrix[0]*tx + matrix[4]*ty;
+      matrix[13] += matrix[1]*tx + matrix[5]*ty;
+      matrix[14] += matrix[2]*tx + matrix[6]*ty;
+      matrix[15] += matrix[3]*tx + matrix[7]*ty;
+    },
+
+    _mapChanged: function () {
+      if (this.map && this.map instanceof google.maps.Map) {
+        // Work around CanvasLayer.prototype's reliance on the Maps API.
+        window.CanvasLayer = createCanvasLayer();
+
+        this._setOverlay(new CanvasLayer({
+          map: this.map,
+          animate: false,
+          resizeHandler: this._resize.bind(this),
+          resolutionScale: this._resolutionScale
+        }));
+
+        // Create shader and attach it to PointLayer
+        this._gl = this.overlay.canvas.getContext('webgl');
+        this._pointProgram = new ShaderProgram(this._gl, this.vertexShader,
+            this.fragmentShader);
+
+        // Initialize transformation matrices.
+        this._pixelsToWebGLMatrix = new Float32Array(16);
+        this._mapMatrix = new Float32Array(16);
+
+        // if data was set before the map was initialized, init it now
+        this._dataChanged();
+      }
+    },
+
+    /**
+     * Sets the data to draw as points.
+     */
+    _dataChanged: function () {
+      if (this._gl && this.data) {
+        if (Array.isArray(this.data) && this.data.length === 0) {
+          return;
+        }
+        
+        // typed array data
+        // var data = new Float32Array(arrayBuffer);
+        // var pointCount = rawData.length / 5;
+        // var points = new Float32Array(pointCount * 2);
+        // for (var i = 0; i < pointCount; i++) {
+          // points[i * 2] = PointLayer.lngToX_(rawData[i * 5 + 1]);
+          // points[i * 2 + 1] = PointLayer.latToY_(rawData[i * 5]);
+        // }
+
+        // TODO(bckenny): add support for other attributes
+        // json data
+        var rawData = this.data;
+        this._pointCount = rawData.length;
+        var points = new Float32Array(this._pointCount * 2);
+        for (var i = 0; i < this._pointCount; i++) {
+          points[i * 2] = this._lngToX(rawData[i].lng);
+          points[i * 2 + 1] = this._latToY(rawData[i].lat);
+        }
+
+        // create webgl buffer, bind it, and load rawData into it
+        this._pointArrayBuffer = this._gl.createBuffer();
+        this._gl.bindBuffer(this._gl.ARRAY_BUFFER, this._pointArrayBuffer);
+        this._gl.bufferData(this._gl.ARRAY_BUFFER, points, this._gl.STATIC_DRAW);
+
+        this.scheduleUpdate();
+      }
+    },
+
+    _uniformsChanged: function() {
+      if (this.overlay) {
+        this.scheduleUpdate();
+      }
+    },
+
+    /**
+     * Resizes the WebGL backing buffer when needed.
+     */
+    _resize: function() {
+      var canvas = this.overlay.canvas;
+      var canvasWidth = canvas.width;
+      var canvasHeight = canvas.height;
+      var resolutionScale = this._resolutionScale;
+
+      this._gl.viewport(0, 0, canvasWidth, canvasHeight);
+
+      this._pixelsToWebGLMatrix.set([
+        2 * resolutionScale / canvasWidth, 0, 0, 0,
+        0, -2 * resolutionScale / canvasHeight, 0, 0,
+        0, 0, 0, 0,
+        -1, 1, 0, 1
+      ]);
+    },
+
+    /**
+     * Renders the points based on the current view. Do not call directly;
+     * instead, this.overlay.scheduleUpdate() to have it be called in next turn
+     * of requestAnimationFrame.
+     */
+    _update: function() {
+      var gl = this._gl;
+      var pointProgram = this._pointProgram;
+
+      pointProgram.use();
+
+      // TODO(bckenny): terrible rAF hack:
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      // turn on alpha blending
+      gl.enable(this._gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      // gl.blendFuncSeparate(gl.ONE, gl.ONE, gl.ONE, gl.ZERO);
+
+      var map = this.map;
+      var mapProjection = map.getProjection();
+      
+      // copy pixel->webgl matrix
+      this._mapMatrix.set(this._pixelsToWebGLMatrix);
+
+      // Scale to current zoom (worldCoords * 2^zoom)
+      var scale = Math.pow(2, map.getZoom());
+      this._scaleMatrix(this._mapMatrix, scale, scale);
+
+      // translate to current view (vector from topLeft to 0,0)
+      var offset = mapProjection.fromLatLngToPoint(this.overlay.getTopLeft());
+      this._translateMatrix(this._mapMatrix, -offset.x, -offset.y);
+
+      // TODO(bckenny): expand to fit any available attributes
+      gl.enableVertexAttribArray(pointProgram.attributes.worldCoord);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this._pointArrayBuffer);
+      gl.vertexAttribPointer(pointProgram.attributes.worldCoord, 2, gl.FLOAT,
+          false, 8, 0);
+
+      // Pass through bound uniforms
+      var uniforms = this.uniforms;
+      for (var uniformName in pointProgram.uniforms) {
+        // Disregard any '_' prefixed variables since reserved for element
+        if (uniformName.charCodeAt(0) !== 95) {
+          pointProgram.uniforms[uniformName](uniforms[uniformName]);
+        }
+      }
+
+      // Manually set reserved uniforms
+      pointProgram.uniforms._mapMatrix(this._mapMatrix);
+      pointProgram.uniforms._resolutionScale(this._resolutionScale);
+
+      // draw!
+      gl.drawArrays(gl.POINTS, 0, this._pointCount);
+    },
+  });
+</script>

@@ -1,0 +1,26 @@
+{
+  "name": "polymer-webgl-visualization",
+  "version": "1.0.0",
+  "homepage": "https://github.com/googlecodelabs/polymer-webgl-visualization",
+  "authors": [
+    "Brendan Kenny <bckenny@google.com>"
+  ],
+  "description": "Resources to support the polymer-webgl-visualization codelab",
+  "main": "point-overlay.html",
+  "keywords": [
+    "polymer",
+    "webgl",
+    "google",
+    "maps",
+    "visualization",
+    "codelab"
+  ],
+  "license": "Apache-2.0",
+  "ignore": [
+    "**/.*",
+    "node_modules",
+    "bower_components",
+    "test",
+    "tests"
+  ]
+}
