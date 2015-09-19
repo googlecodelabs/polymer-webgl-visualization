@@ -43,6 +43,8 @@ Uses WebGL for rendering.
       },
 
       // TODO(bckenny): maybe increase size to account for filterPixelWidth
+      // TODO(bckenny): get rid of alpha. Move (vec3) color into vertex shader,
+      // passes as varying, to ease explanation for codelab
       /**
        * The vertex shader source. Uniforms beginning with '_' are reserved for
        * internal <point-overlay> settings.
@@ -51,7 +53,7 @@ Uses WebGL for rendering.
         type: String,
         value: function() {
             return [
-            'attribute vec4 worldCoord;',
+            'attribute vec4 _worldCoord;',
 
             '// point-overlay provided uniforms',
             'uniform mat4 _mapMatrix;',
@@ -65,7 +67,7 @@ Uses WebGL for rendering.
 
             'void main() {',
             '  // transform world coordinate by matrix uniform variable',
-            '  gl_Position = _mapMatrix * worldCoord;',
+            '  gl_Position = _mapMatrix * _worldCoord;',
 
             '  pointWidth = pointSize * _resolutionScale;',
             '  gl_PointSize = pointWidth;',
@@ -75,6 +77,7 @@ Uses WebGL for rendering.
         },
       },
 
+      // TODO(bckenny): get rid of mix for filtered
       /**
        * The fragment shader source. Uniforms beginning with '_' are reserved
        * for internal <point-overlay> settings.
@@ -183,6 +186,12 @@ Uses WebGL for rendering.
      * @private {WebGLBuffer}
      */
     _pointArrayBuffer: null,
+
+    /**
+     * The layout of the data in the _pointArrayBuffer.
+     * @type {Object}
+     */
+    _dataLayout: null,
 
     /**
      * The number of points to render
@@ -301,20 +310,93 @@ Uses WebGL for rendering.
           // points[i * 2 + 1] = PointLayer.latToY_(rawData[i * 5]);
         // }
 
-        // TODO(bckenny): add support for other attributes
-        // json data
+        // From json data.
         var rawData = this.data;
+        var firstPoint = rawData[0];
+
+        var layout = {};
+        var byteOffset = 0;
+
+        // First, all points must have a lat/lng pair. These are joined and
+        // provided as _worldCoord, a vec2, in the (default) shader.
+        layout._worldCoord = {
+          length: 2,
+          byteOffset: 0
+        };
+        byteOffset += (2 * 4);
+
+        // Next, find candidate attributes and track struct layout.
+        var attrs = Object.keys(firstPoint);
+        for (var i = 0; i < attrs.length; i++) {
+          var attr = attrs[i];
+          if (attr === 'lat' || attr === 'lng') {
+            continue;
+          }
+
+          var attrValue = firstPoint[attr];
+          var attrLength;
+          // An attribute is useable if number or array-like containing numbers.
+          if (typeof attrValue === 'number') {
+            attrLength = 1;
+          } else if (Array.isArray(attrValue) || ArrayBuffer.isView(attrValue)) {
+            if (attrValue.length < 2 || attrValue.length > 4) {
+              console.warn('attribute ' + attr + ' has length ' +
+                  attrValue.length + ', which is not supported. ' + attr +
+                  ' will be skipped.');
+              continue;
+            }
+            attrLength = attrValue.length;
+          } else {
+            // All other data types not supported.
+            continue;
+          }
+
+          // Add attribute to data layout.
+          layout[attr] = {
+            length: attrLength,
+            byteOffset: byteOffset
+          };
+          // Assume all numbers will be float32.
+          byteOffset += (attrLength * 4);
+        }
+        layout._byteLength = byteOffset;
+        var attrCount = byteOffset / 4;
+
         this._pointCount = rawData.length;
-        var points = new Float32Array(this._pointCount * 2);
-        for (var i = 0; i < this._pointCount; i++) {
-          points[i * 2] = this._lngToX(rawData[i].lng);
-          points[i * 2 + 1] = this._latToY(rawData[i].lat);
+        var points = new Float32Array(this._pointCount * attrCount);
+
+        for (i = 0; i < this._pointCount; i++) {
+          var datum = rawData[i];
+          // Always start with _worldCoord
+          points[i * attrCount] = this._lngToX(datum.lng);
+          points[i * attrCount + 1] = this._latToY(datum.lat);
+          var cursor = 2;
+
+          for (var attrName in layout) {
+            // Skip reserved names beginning with '_'.
+            if (attrName.charCodeAt(0) === 95) {
+              continue;
+            }
+            var attribute = layout[attrName];
+
+            if (attribute.length === 1) {
+              points[i * attrCount + cursor] = datum[attrName];
+              cursor++;
+            } else {
+              for (var j = 0; j < attribute.length; j++) {
+                points[i * attrCount + cursor] = datum[attrName][j];
+                cursor++;
+              }
+            }
+          }
         }
 
         // create webgl buffer, bind it, and load rawData into it
         this._pointArrayBuffer = this._gl.createBuffer();
         this._gl.bindBuffer(this._gl.ARRAY_BUFFER, this._pointArrayBuffer);
         this._gl.bufferData(this._gl.ARRAY_BUFFER, points, this._gl.STATIC_DRAW);
+
+        this._dataLayout = layout;
 
         this.scheduleUpdate();
       }
@@ -378,19 +460,27 @@ Uses WebGL for rendering.
       var offset = mapProjection.fromLatLngToPoint(this.overlay.getTopLeft());
       this._translateMatrix(this._mapMatrix, -offset.x, -offset.y);
 
-      // TODO(bckenny): expand to fit any available attributes
-      gl.enableVertexAttribArray(pointProgram.attributes.worldCoord);
-      gl.bindBuffer(gl.ARRAY_BUFFER, this._pointArrayBuffer);
-      gl.vertexAttribPointer(pointProgram.attributes.worldCoord, 2, gl.FLOAT,
-          false, 8, 0);
+      // Pass through bound data.
+      // For now, assume all data is gl.FLOAT (see _dataChanged)
+      var layout = this._dataLayout;
+      for (var attributeName in pointProgram.attributes) {
+        gl.enableVertexAttribArray(pointProgram.attributes[attributeName]);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this._pointArrayBuffer);
+        var attributeLayout = layout[attributeName];
+        gl.vertexAttribPointer(pointProgram.attributes[attributeName],
+            attributeLayout.length, gl.FLOAT, false, layout._byteLength,
+            attributeLayout.byteOffset);
+      }
 
       // Pass through bound uniforms
       var uniforms = this.uniforms;
       for (var uniformName in pointProgram.uniforms) {
         // Disregard any '_' prefixed variables since reserved for element
-        if (uniformName.charCodeAt(0) !== 95) {
-          pointProgram.uniforms[uniformName](uniforms[uniformName]);
+        if (uniformName.charCodeAt(0) === 95) {
+          continue;
         }
+
+        pointProgram.uniforms[uniformName](uniforms[uniformName]);
       }
 
       // Manually set reserved uniforms
