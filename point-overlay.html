@@ -19,6 +19,7 @@ Uses WebGL for rendering.
 @homepage https://github.com/googlecodelabs/polymer-webgl-visualization
 -->
 <script>
+  // TODO(bckenny): Promise polyfill
   /* jshint newcap: false */
   /* global Polymer, ShaderProgram, createCanvasLayer, CanvasLayer */
   Polymer({
@@ -50,29 +51,37 @@ Uses WebGL for rendering.
       vertexShader: {
         type: String,
         value: function() {
-            return [
-            'attribute vec4 worldCoord;',
-
-            '// point-overlay provided uniforms',
+          return [
+            '// Uniforms: global values for all points in this draw call.',
+            '// point-overlay-provided uniforms',
             'uniform mat4 _mapMatrix;',
             'uniform float _resolutionScale;',
 
+            '// User-provided uniforms.',
             'uniform float pointSize;',
-            'uniform float pointAlpha;',
 
-            'varying float alpha;',
+            '// Attributes: values associated with this point.',
+            'attribute vec4 _worldCoord;',
+
+            '// Varyings: Variables passed to fragment shader.',
             'varying float pointWidth;',
+            'varying vec3 pointColor;',
+
+            'const vec3 baseColor = vec3(.9, .3, .1);',
 
             'void main() {',
-            '  // transform world coordinate by matrix uniform variable',
-            '  gl_Position = _mapMatrix * worldCoord;',
+            '  // Transform world coordinate to particular view based on the map position.',
+            '  gl_Position = _mapMatrix * _worldCoord;',
 
+            '  // Calculate point size, scaling by resolution multiplier of the screen.',
             '  pointWidth = pointSize * _resolutionScale;',
             '  gl_PointSize = pointWidth;',
-            '  alpha = pointAlpha;',
+
+            '  // Pass pointColor to the fragment shader.',
+            '  pointColor = baseColor;',
             '}'
           ].join('\n');
-        },
+        }
       },
 
       /**
@@ -82,24 +91,28 @@ Uses WebGL for rendering.
       fragmentShader: {
         type: String,
         value: function() {
-            return [
-              'precision mediump float;',
+          return [
+            'precision mediump float;',
 
-              'const vec4 color = vec4(.9, .3, .1, 1.);',
-              'const vec4 blank = vec4(0.);',
-              'const float filterPixelWidth = 1.4142135623730951;',
+            'const float filterPixelWidth = 1.4142135623730951;',
 
-              'varying float alpha;',
-              'varying float pointWidth;',
+            '// Varyings: Variables passed from the vertex shader.',
+            'varying float pointWidth;',
+            'varying vec3 pointColor;',
 
-              'void main() {',
-              '  float dist = length(gl_PointCoord - .5);',
-              '  float filterWidth = filterPixelWidth / pointWidth;',
-              '  float filtered = smoothstep(.5 - filterWidth, .5, dist);',
-              '  gl_FragColor = mix(color, blank, filtered) *  alpha;',
-              '}'
-            ].join('\n');
-        },
+            'void main() {',
+            '  // gl_PointCoord is the coordinate of the fragment (or pixel) this shader is',
+            '  // painting. Runs from 0 to 1, with (.5, .5) at the center of the point. Color',
+            '  // all points within .5 of the center, with some nice antialiasing added.',
+            '  float dist = length(gl_PointCoord - .5);',
+            '  float filterWidth = filterPixelWidth / pointWidth;',
+            '  float filtered = 1. - smoothstep(.5 - filterWidth, .5, dist);',
+
+            '  // Add an alpha blend to the color based on the filtered distance.',
+            '  gl_FragColor = vec4(pointColor, 1.) * filtered;',
+            '}',
+          ].join('\n');
+        }
       },
 
       uniforms: {
@@ -138,7 +151,8 @@ Uses WebGL for rendering.
     },
 
      observers: [
-      '_uniformsChanged(uniforms.*)'
+      '_uniformsChanged(uniforms.*)',
+      '_shadersChanged(vertexShader, fragmentShader)'
     ],
 
     /**
@@ -183,6 +197,12 @@ Uses WebGL for rendering.
      * @private {WebGLBuffer}
      */
     _pointArrayBuffer: null,
+
+    /**
+     * The layout of the data in the _pointArrayBuffer.
+     * @type {Object}
+     */
+    _dataLayout: null,
 
     /**
      * The number of points to render
@@ -269,10 +289,9 @@ Uses WebGL for rendering.
           resolutionScale: this._resolutionScale
         }));
 
-        // Create shader and attach it to PointLayer
+        // Create WebGL context and kick off shader init
         this._gl = this.overlay.canvas.getContext('webgl');
-        this._pointProgram = new ShaderProgram(this._gl, this.vertexShader,
-            this.fragmentShader);
+        this._shadersChanged();
 
         // Initialize transformation matrices.
         this._pixelsToWebGLMatrix = new Float32Array(16);
@@ -301,14 +320,85 @@ Uses WebGL for rendering.
           // points[i * 2 + 1] = PointLayer.latToY_(rawData[i * 5]);
         // }
 
-        // TODO(bckenny): add support for other attributes
-        // json data
+        // From json data.
         var rawData = this.data;
+        var firstPoint = rawData[0];
+
+        var layout = {};
+        var byteOffset = 0;
+
+        // First, all points must have a lat/lng pair. These are joined and
+        // provided as _worldCoord, a vec2, in the (default) shader.
+        layout._worldCoord = {
+          length: 2,
+          byteOffset: 0
+        };
+        byteOffset += (2 * 4);
+
+        // Next, find candidate attributes and track struct layout.
+        var attrs = Object.keys(firstPoint);
+        for (var i = 0; i < attrs.length; i++) {
+          var attr = attrs[i];
+          if (attr === 'lat' || attr === 'lng') {
+            continue;
+          }
+
+          var attrValue = firstPoint[attr];
+          var attrLength;
+          // An attribute is useable if number or array-like containing numbers.
+          if (typeof attrValue === 'number') {
+            attrLength = 1;
+          } else if (Array.isArray(attrValue) || ArrayBuffer.isView(attrValue)) {
+            if (attrValue.length < 2 || attrValue.length > 4) {
+              console.warn('attribute ' + attr + ' has length ' +
+                  attrValue.length + ', which is not supported. ' + attr +
+                  ' will be skipped.');
+              continue;
+            }
+            attrLength = attrValue.length;
+          } else {
+            // All other data types not supported.
+            continue;
+          }
+
+          // Add attribute to data layout.
+          layout[attr] = {
+            length: attrLength,
+            byteOffset: byteOffset
+          };
+          // Assume all numbers will be float32.
+          byteOffset += (attrLength * 4);
+        }
+        layout._byteLength = byteOffset;
+        var attrCount = byteOffset / 4;
+
         this._pointCount = rawData.length;
-        var points = new Float32Array(this._pointCount * 2);
-        for (var i = 0; i < this._pointCount; i++) {
-          points[i * 2] = this._lngToX(rawData[i].lng);
-          points[i * 2 + 1] = this._latToY(rawData[i].lat);
+        var points = new Float32Array(this._pointCount * attrCount);
+
+        for (i = 0; i < this._pointCount; i++) {
+          var datum = rawData[i];
+          // Always start with _worldCoord
+          points[i * attrCount] = this._lngToX(datum.lng);
+          points[i * attrCount + 1] = this._latToY(datum.lat);
+          var cursor = 2;
+
+          for (var attrName in layout) {
+            // Skip reserved names beginning with '_'.
+            if (attrName.charCodeAt(0) === 95) {
+              continue;
+            }
+            var attribute = layout[attrName];
+
+            if (attribute.length === 1) {
+              points[i * attrCount + cursor] = datum[attrName];
+              cursor++;
+            } else {
+              for (var j = 0; j < attribute.length; j++) {
+                points[i * attrCount + cursor] = datum[attrName][j];
+                cursor++;
+              }
+            }
+          }
         }
 
         // create webgl buffer, bind it, and load rawData into it
@@ -316,8 +406,61 @@ Uses WebGL for rendering.
         this._gl.bindBuffer(this._gl.ARRAY_BUFFER, this._pointArrayBuffer);
         this._gl.bufferData(this._gl.ARRAY_BUFFER, points, this._gl.STATIC_DRAW);
 
+        this._dataLayout = layout;
+
         this.scheduleUpdate();
       }
+    },
+
+    _debounceShadersChanged: function() {
+      this.debounce('shadersChanged', this._shadersChanged);
+    },
+
+    /**
+     * (Optionally) fetches and compiles shader from sources.
+     */
+    _shadersChanged: function() {
+      this.cancelDebouncer('shadersChanged');
+
+      if (!this._gl) {
+        // Map (and therefore GL context) not created yet.
+        return;
+      }
+
+      if (!this._pointProgram) {
+        this._pointProgram = new ShaderProgram(this._gl);
+      }
+
+      // TODO(bckenny): currently fetches (if necessary) and recompiles both,
+      // even if only one is being (re)set. Could do dirty checking.
+      var vertexSrc = this.vertexShader;
+      var fragSrc = this.fragmentShader;
+
+      // .vert/.glsl suffixes go to xhr.
+      var vertexPromise;
+      if (/\.vert$/.test(vertexSrc) || /\.glsl$/.test(vertexSrc)) {
+        vertexPromise = ShaderProgram.promiseXhr_(vertexSrc);
+      } else {
+        vertexPromise = Promise.resolve(vertexSrc);
+      }
+
+      // .frag/.glsl suffixes go to xhr.
+      var fragmentPromise;
+      if (/\.frag$/.test(fragSrc) || /\.glsl$/.test(fragSrc)) {
+        fragmentPromise = ShaderProgram.promiseXhr_(fragSrc);
+      } else {
+        fragmentPromise = Promise.resolve(fragSrc);
+      }
+
+      var program = this._pointProgram;
+      Promise.all([
+        vertexPromise.then(program.setVertexShader.bind(program)),
+        fragmentPromise.then(program.setFragmentShader.bind(program))
+      ]).then(function() {
+        program.link();
+        this.scheduleUpdate();
+      }.bind(this));
+      // TODO(bckenny): failure case? Right now uncaught
     },
 
     _uniformsChanged: function() {
@@ -378,11 +521,17 @@ Uses WebGL for rendering.
       var offset = mapProjection.fromLatLngToPoint(this.overlay.getTopLeft());
       this._translateMatrix(this._mapMatrix, -offset.x, -offset.y);
 
-      // TODO(bckenny): expand to fit any available attributes
-      gl.enableVertexAttribArray(pointProgram.attributes.worldCoord);
-      gl.bindBuffer(gl.ARRAY_BUFFER, this._pointArrayBuffer);
-      gl.vertexAttribPointer(pointProgram.attributes.worldCoord, 2, gl.FLOAT,
-          false, 8, 0);
+      // Pass through bound data.
+      // For now, assume all data is gl.FLOAT (see _dataChanged)
+      var layout = this._dataLayout;
+      for (var attributeName in pointProgram.attributes) {
+        gl.enableVertexAttribArray(pointProgram.attributes[attributeName]);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this._pointArrayBuffer);
+        var attributeLayout = layout[attributeName];
+        gl.vertexAttribPointer(pointProgram.attributes[attributeName],
+            attributeLayout.length, gl.FLOAT, false, layout._byteLength,
+            attributeLayout.byteOffset);
+      }
 
       // Pass through bound uniforms
       var uniforms = this.uniforms;
@@ -394,8 +543,12 @@ Uses WebGL for rendering.
       }
 
       // Manually set reserved uniforms
-      pointProgram.uniforms._mapMatrix(this._mapMatrix);
-      pointProgram.uniforms._resolutionScale(this._resolutionScale);
+      if (pointProgram.uniforms._mapMatrix) {
+        pointProgram.uniforms._mapMatrix(this._mapMatrix);
+      }
+      if (pointProgram.uniforms._resolutionScale) {
+        pointProgram.uniforms._resolutionScale(this._resolutionScale);
+      }
 
       // draw!
       gl.drawArrays(gl.POINTS, 0, this._pointCount);
