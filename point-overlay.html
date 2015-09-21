@@ -44,8 +44,6 @@ Uses WebGL for rendering.
       },
 
       // TODO(bckenny): maybe increase size to account for filterPixelWidth
-      // TODO(bckenny): get rid of alpha. Move (vec3) color into vertex shader,
-      // passes as varying, to ease explanation for codelab
       /**
        * The vertex shader source. Uniforms beginning with '_' are reserved for
        * internal <point-overlay> settings.
@@ -53,32 +51,39 @@ Uses WebGL for rendering.
       vertexShader: {
         type: String,
         value: function() {
-            return [
-            'attribute vec4 _worldCoord;',
-
-            '// point-overlay provided uniforms',
+          return [
+            '// Uniforms: global values for all points in this draw call.',
+            '// point-overlay-provided uniforms',
             'uniform mat4 _mapMatrix;',
             'uniform float _resolutionScale;',
 
+            '// User-provided uniforms.',
             'uniform float pointSize;',
-            'uniform float pointAlpha;',
 
-            'varying float alpha;',
+            '// Attributes: values associated with this point.',
+            'attribute vec4 _worldCoord;',
+
+            '// Varyings: Variables passed to fragment shader.',
             'varying float pointWidth;',
+            'varying vec3 pointColor;',
+
+            'const vec3 baseColor = vec3(.9, .3, .1);',
 
             'void main() {',
-            '  // transform world coordinate by matrix uniform variable',
+            '  // Transform world coordinate to particular view based on the map position.',
             '  gl_Position = _mapMatrix * _worldCoord;',
 
+            '  // Calculate point size, scaling by resolution multiplier of the screen.',
             '  pointWidth = pointSize * _resolutionScale;',
             '  gl_PointSize = pointWidth;',
-            '  alpha = pointAlpha;',
+
+            '  // Pass pointColor to the fragment shader.',
+            '  pointColor = baseColor;',
             '}'
           ].join('\n');
         }
       },
 
-      // TODO(bckenny): get rid of mix for filtered
       /**
        * The fragment shader source. Uniforms beginning with '_' are reserved
        * for internal <point-overlay> settings.
@@ -86,23 +91,27 @@ Uses WebGL for rendering.
       fragmentShader: {
         type: String,
         value: function() {
-            return [
-              'precision mediump float;',
+          return [
+            'precision mediump float;',
 
-              'const vec4 color = vec4(.9, .3, .1, 1.);',
-              'const vec4 blank = vec4(0.);',
-              'const float filterPixelWidth = 1.4142135623730951;',
+            'const float filterPixelWidth = 1.4142135623730951;',
 
-              'varying float alpha;',
-              'varying float pointWidth;',
+            '// Varyings: Variables passed from the vertex shader.',
+            'varying float pointWidth;',
+            'varying vec3 pointColor;',
 
-              'void main() {',
-              '  float dist = length(gl_PointCoord - .5);',
-              '  float filterWidth = filterPixelWidth / pointWidth;',
-              '  float filtered = smoothstep(.5 - filterWidth, .5, dist);',
-              '  gl_FragColor = mix(color, blank, filtered) *  alpha;',
-              '}'
-            ].join('\n');
+            'void main() {',
+            '  // gl_PointCoord is the coordinate of the fragment (or pixel) this shader is',
+            '  // painting. Runs from 0 to 1, with (.5, .5) at the center of the point. Color',
+            '  // all points within .5 of the center, with some nice antialiasing added.',
+            '  float dist = length(gl_PointCoord - .5);',
+            '  float filterWidth = filterPixelWidth / pointWidth;',
+            '  float filtered = 1. - smoothstep(.5 - filterWidth, .5, dist);',
+
+            '  // Add an alpha blend to the color based on the filtered distance.',
+            '  gl_FragColor = vec4(pointColor, 1.) * filtered;',
+            '}',
+          ].join('\n');
         }
       },
 
@@ -534,8 +543,12 @@ Uses WebGL for rendering.
       }
 
       // Manually set reserved uniforms
-      pointProgram.uniforms._mapMatrix(this._mapMatrix);
-      pointProgram.uniforms._resolutionScale(this._resolutionScale);
+      if (pointProgram.uniforms._mapMatrix) {
+        pointProgram.uniforms._mapMatrix(this._mapMatrix);
+      }
+      if (pointProgram.uniforms._resolutionScale) {
+        pointProgram.uniforms._resolutionScale(this._resolutionScale);
+      }
 
       // draw!
       gl.drawArrays(gl.POINTS, 0, this._pointCount);
