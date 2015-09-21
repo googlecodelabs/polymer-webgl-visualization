@@ -19,6 +19,7 @@ Uses WebGL for rendering.
 @homepage https://github.com/googlecodelabs/polymer-webgl-visualization
 -->
 <script>
+  // TODO(bckenny): Promise polyfill
   /* jshint newcap: false */
   /* global Polymer, ShaderProgram, createCanvasLayer, CanvasLayer */
   Polymer({
@@ -74,7 +75,7 @@ Uses WebGL for rendering.
             '  alpha = pointAlpha;',
             '}'
           ].join('\n');
-        },
+        }
       },
 
       // TODO(bckenny): get rid of mix for filtered
@@ -102,7 +103,7 @@ Uses WebGL for rendering.
               '  gl_FragColor = mix(color, blank, filtered) *  alpha;',
               '}'
             ].join('\n');
-        },
+        }
       },
 
       uniforms: {
@@ -141,7 +142,8 @@ Uses WebGL for rendering.
     },
 
      observers: [
-      '_uniformsChanged(uniforms.*)'
+      '_uniformsChanged(uniforms.*)',
+      '_shadersChanged(vertexShader, fragmentShader)'
     ],
 
     /**
@@ -278,10 +280,9 @@ Uses WebGL for rendering.
           resolutionScale: this._resolutionScale
         }));
 
-        // Create shader and attach it to PointLayer
+        // Create WebGL context and kick off shader init
         this._gl = this.overlay.canvas.getContext('webgl');
-        this._pointProgram = new ShaderProgram(this._gl, this.vertexShader,
-            this.fragmentShader);
+        this._shadersChanged();
 
         // Initialize transformation matrices.
         this._pixelsToWebGLMatrix = new Float32Array(16);
@@ -402,6 +403,57 @@ Uses WebGL for rendering.
       }
     },
 
+    _debounceShadersChanged: function() {
+      this.debounce('shadersChanged', this._shadersChanged);
+    },
+
+    /**
+     * (Optionally) fetches and compiles shader from sources.
+     */
+    _shadersChanged: function() {
+      this.cancelDebouncer('shadersChanged');
+
+      if (!this._gl) {
+        // Map (and therefore GL context) not created yet.
+        return;
+      }
+
+      if (!this._pointProgram) {
+        this._pointProgram = new ShaderProgram(this._gl);
+      }
+
+      // TODO(bckenny): currently fetches (if necessary) and recompiles both,
+      // even if only one is being (re)set. Could do dirty checking.
+      var vertexSrc = this.vertexShader;
+      var fragSrc = this.fragmentShader;
+
+      // .vert/.glsl suffixes go to xhr.
+      var vertexPromise;
+      if (/\.vert$/.test(vertexSrc) || /\.glsl$/.test(vertexSrc)) {
+        vertexPromise = ShaderProgram.promiseXhr_(vertexSrc);
+      } else {
+        vertexPromise = Promise.resolve(vertexSrc);
+      }
+
+      // .frag/.glsl suffixes go to xhr.
+      var fragmentPromise;
+      if (/\.frag$/.test(fragSrc) || /\.glsl$/.test(fragSrc)) {
+        fragmentPromise = ShaderProgram.promiseXhr_(fragSrc);
+      } else {
+        fragmentPromise = Promise.resolve(fragSrc);
+      }
+
+      var program = this._pointProgram;
+      Promise.all([
+        vertexPromise.then(program.setVertexShader.bind(program)),
+        fragmentPromise.then(program.setFragmentShader.bind(program))
+      ]).then(function() {
+        program.link();
+        this.scheduleUpdate();
+      }.bind(this));
+      // TODO(bckenny): failure case? Right now uncaught
+    },
+
     _uniformsChanged: function() {
       if (this.overlay) {
         this.scheduleUpdate();
@@ -476,11 +528,9 @@ Uses WebGL for rendering.
       var uniforms = this.uniforms;
       for (var uniformName in pointProgram.uniforms) {
         // Disregard any '_' prefixed variables since reserved for element
-        if (uniformName.charCodeAt(0) === 95) {
-          continue;
+        if (uniformName.charCodeAt(0) !== 95) {
+          pointProgram.uniforms[uniformName](uniforms[uniformName]);
         }
-
-        pointProgram.uniforms[uniformName](uniforms[uniformName]);
       }
 
       // Manually set reserved uniforms
